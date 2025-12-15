@@ -286,7 +286,7 @@ class TrellisImageTo3DPipeline(Pipeline):
         sampler_name: str,
         num_images: int,
         num_steps: int,
-        mode: Literal['multidiffusion'] = 'multidiffusion',
+        mode: Literal['stochastic', 'multidiffusion'] = 'multidiffusion',
     ):
         """
         Inject a sampler with multiple images as condition.
@@ -298,22 +298,37 @@ class TrellisImageTo3DPipeline(Pipeline):
         """
         sampler = getattr(self, sampler_name)
         setattr(sampler, f'_old_inference_model', sampler._inference_model)
+
+        if mode == 'stochastic':
+            if num_images > num_steps:
+                print(f"\033[93mWarning: number of conditioning images is greater than number of steps for {sampler_name}. "
+                    "This may lead to performance degradation.\033[0m")
+
+            cond_indices = (np.arange(num_steps) % num_images).tolist()
+            def _new_inference_model(self, model, x_t, t, cond, **kwargs):
+                cond_idx = cond_indices.pop(0)
+                cond_i = cond[cond_idx:cond_idx+1]
+                return self._old_inference_model(model, x_t, t, cond=cond_i, **kwargs)
         
-        from .samplers import FlowEulerSampler
-        def _new_inference_model(self, model, x_t, t, cond, neg_cond, cfg_strength, cfg_interval, **kwargs):
-            if cfg_interval[0] <= t <= cfg_interval[1]:
-                preds = []
-                for i in range(len(cond)):
-                    preds.append(FlowEulerSampler._inference_model(self, model, x_t, t, cond[i:i+1], **kwargs))
-                pred = sum(preds) / len(preds)
-                neg_pred = FlowEulerSampler._inference_model(self, model, x_t, t, neg_cond, **kwargs)
-                return (1 + cfg_strength) * pred - cfg_strength * neg_pred
-            else:
-                preds = []
-                for i in range(len(cond)):
-                    preds.append(FlowEulerSampler._inference_model(self, model, x_t, t, cond[i:i+1], **kwargs))
-                pred = sum(preds) / len(preds)
-                return pred
+        elif mode =='multidiffusion':
+            from .samplers import FlowEulerSampler
+            def _new_inference_model(self, model, x_t, t, cond, neg_cond, cfg_strength, cfg_interval, **kwargs):
+                if cfg_interval[0] <= t <= cfg_interval[1]:
+                    preds = []
+                    for i in range(len(cond)):
+                        preds.append(FlowEulerSampler._inference_model(self, model, x_t, t, cond[i:i+1], **kwargs))
+                    pred = sum(preds) / len(preds)
+                    neg_pred = FlowEulerSampler._inference_model(self, model, x_t, t, neg_cond, **kwargs)
+                    return (1 + cfg_strength) * pred - cfg_strength * neg_pred
+                else:
+                    preds = []
+                    for i in range(len(cond)):
+                        preds.append(FlowEulerSampler._inference_model(self, model, x_t, t, cond[i:i+1], **kwargs))
+                    pred = sum(preds) / len(preds)
+                    return pred
+            
+        else:
+            raise ValueError(f"Unsupported mode: {mode}")
             
         sampler._inference_model = _new_inference_model.__get__(sampler, type(sampler))
 
@@ -321,6 +336,7 @@ class TrellisImageTo3DPipeline(Pipeline):
 
         sampler._inference_model = sampler._old_inference_model
         delattr(sampler, f'_old_inference_model')
+
 
     @torch.no_grad()
     def run_multi_image(

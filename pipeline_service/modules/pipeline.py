@@ -155,7 +155,7 @@ class GenerationPipeline:
             TrellisRequest(
                 images=[
                     image_without_background,
-                    # original_image_without_background,
+                    original_image_without_background,
                 ],
                 seed=request.seed,
                 params=trellis_params,

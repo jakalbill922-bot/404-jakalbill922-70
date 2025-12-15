@@ -66,12 +66,12 @@ class TrellisService:
                 },
                 slat_sampler_params={
                     "steps": params.slat_steps,
-                    "cfg_strength": params.slat_cfg_strength,
-                    
+                    "cfg_strength": params.slat_cfg_strength,  
                 },
                 preprocess_image=False,
                 formats=["gaussian"],
                 num_oversamples=params.num_oversamples,
+                mode="multidiffusion",
             )
 
             generation_time = time.time() - start
