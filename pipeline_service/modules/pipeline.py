@@ -13,11 +13,23 @@ import gc
 
 from config import Settings, settings
 from logger_config import logger
-from schemas import GenerateRequest, GenerateResponse, TrellisParams, TrellisRequest, TrellisResult
+from schemas import (
+    GenerateRequest,
+    GenerateResponse,
+    TrellisParams,
+    TrellisRequest,
+    TrellisResult,
+)
 from modules.image_edit.qwen_edit_module import QwenEditModule
 from modules.background_removal.rmbg_manager import BackgroundRemovalService
 from modules.gs_generator.trellis_manager import TrellisService
-from modules.utils import secure_randint, set_random_seed, decode_image, to_png_base64, save_files
+from modules.utils import (
+    secure_randint,
+    set_random_seed,
+    decode_image,
+    to_png_base64,
+    save_files,
+)
 
 
 class GenerationPipeline:
@@ -37,11 +49,11 @@ class GenerationPipeline:
         await self.qwen_edit.startup()
         await self.rmbg.startup()
         await self.trellis.startup()
-        
+
         logger.info("Warming up generator...")
         await self.warmup_generator()
         self._clean_gpu_memory()
-        
+
         logger.success("Warmup is complete. Pipeline ready to work.")
 
     async def shutdown(self) -> None:
@@ -64,49 +76,47 @@ class GenerationPipeline:
 
     async def warmup_generator(self) -> None:
         """Function for warming up the generator"""
-        
-        temp_image = Image.new("RGB",(64,64),color=(128,128,128))
+
+        temp_image = Image.new("RGB", (64, 64), color=(128, 128, 128))
         buffer = io.BytesIO()
         temp_image.save(buffer, format="PNG")
         temp_imge_bytes = buffer.getvalue()
-        await self.generate_from_upload(temp_imge_bytes,seed=42)
+        await self.generate_from_upload(temp_imge_bytes, seed=42)
 
     async def generate_from_upload(self, image_bytes: bytes, seed: int) -> bytes:
         """
         Generate 3D model from uploaded image file and return PLY as bytes.
-        
+
         Args:
             image_bytes: Raw image bytes from uploaded file
-            
+
         Returns:
             PLY file as bytes
         """
         # Encode to base64
         image_base64 = base64.b64encode(image_bytes).decode("utf-8")
-        
+
         # Create request
         request = GenerateRequest(
-            prompt_image=image_base64,
-            prompt_type="image",
-            seed=seed
+            prompt_image=image_base64, prompt_type="image", seed=seed
         )
-        
+
         # Generate
         response = await self.generate_gs(request)
-        
+
         # Return binary PLY
         if not response.ply_file_base64:
             raise ValueError("PLY generation failed")
-            
-        return response.ply_file_base64 # bytes
+
+        return response.ply_file_base64  # bytes
 
     async def generate_gs(self, request: GenerateRequest) -> GenerateResponse:
         """
         Execute full generation pipeline.
-        
+
         Args:
             request: Generation request with prompt and settings
-            
+
         Returns:
             GenerateResponse with generated assets
         """
@@ -129,24 +139,34 @@ class GenerationPipeline:
         # 2. Remove background
         image_without_background = self.rmbg.remove_background(image_edited)
 
+        # add another view of the image
+        image_edited_2 = self.qwen_edit.edit_image(
+            prompt_image=image_edited, seed=request.seed, 
+            positive="Show this object in another three-quarters view and make sure it is fully visible. Turn background neutral solid color contrasting with an object. Delete background details. Delete watermarks. Keep object colors. Sharpen image details"
+        )
+        image_without_background_2 = self.rmbg.remove_background(image_edited_2)
+
+        # save to debug
+        image_edited.save("image_edited.png")
+        image_edited_2.save("image_edited_2.png")
+        image_without_background.save("image_without_background.png")
+
         trellis_result: Optional[TrellisResult] = None
-        
+
         # Resolve Trellis parameters from request
         trellis_params: TrellisParams = request.trellis_params
-       
+
         # 3. Generate the 3D model
         trellis_result = self.trellis.generate(
             TrellisRequest(
-                image=image_without_background,
-                seed=request.seed,
-                params=trellis_params
+                images=[image_without_background, image_without_background_2], seed=request.seed, params=trellis_params
             )
         )
 
         # Save generated files
         if self.settings.save_generated_files:
             save_files(trellis_result, image_edited, image_without_background)
-        
+
         # Convert to PNG base64 for response (only if needed)
         image_edited_base64 = None
         image_without_background_base64 = None
@@ -164,8 +184,11 @@ class GenerationPipeline:
         response = GenerateResponse(
             generation_time=generation_time,
             ply_file_base64=trellis_result.ply_file if trellis_result else None,
-            image_edited_file_base64=image_edited_base64 if self.settings.send_generated_files else None,
-            image_without_background_file_base64=image_without_background_base64 if self.settings.send_generated_files else None,
+            image_edited_file_base64=image_edited_base64
+            if self.settings.send_generated_files
+            else None,
+            image_without_background_file_base64=image_without_background_base64
+            if self.settings.send_generated_files
+            else None,
         )
         return response
-

@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from torchvision import transforms
+from contextlib import contextmanager
 from PIL import Image
 
 from .base import Pipeline
@@ -277,3 +278,81 @@ class TrellisImageTo3DPipeline(Pipeline):
         indices = torch.arange(num_samples).repeat_interleave(sizes).unsqueeze(-1).to(selected_coords.device, selected_coords.dtype)
         selected_coords = torch.cat((indices, selected_coords), dim=1)
         return selected_coords
+
+
+    @contextmanager
+    def inject_sampler_multi_image(
+        self,
+        sampler_name: str,
+        num_images: int,
+        num_steps: int,
+        mode: Literal['multidiffusion'] = 'multidiffusion',
+    ):
+        """
+        Inject a sampler with multiple images as condition.
+        
+        Args:
+            sampler_name (str): The name of the sampler to inject.
+            num_images (int): The number of images to condition on.
+            num_steps (int): The number of steps to run the sampler for.
+        """
+        sampler = getattr(self, sampler_name)
+        setattr(sampler, f'_old_inference_model', sampler._inference_model)
+        
+        from .samplers import FlowEulerSampler
+        def _new_inference_model(self, model, x_t, t, cond, neg_cond, cfg_strength, cfg_interval, **kwargs):
+            if cfg_interval[0] <= t <= cfg_interval[1]:
+                preds = []
+                for i in range(len(cond)):
+                    preds.append(FlowEulerSampler._inference_model(self, model, x_t, t, cond[i:i+1], **kwargs))
+                pred = sum(preds) / len(preds)
+                neg_pred = FlowEulerSampler._inference_model(self, model, x_t, t, neg_cond, **kwargs)
+                return (1 + cfg_strength) * pred - cfg_strength * neg_pred
+            else:
+                preds = []
+                for i in range(len(cond)):
+                    preds.append(FlowEulerSampler._inference_model(self, model, x_t, t, cond[i:i+1], **kwargs))
+                pred = sum(preds) / len(preds)
+                return pred
+            
+        sampler._inference_model = _new_inference_model.__get__(sampler, type(sampler))
+
+        yield
+
+        sampler._inference_model = sampler._old_inference_model
+        delattr(sampler, f'_old_inference_model')
+
+    @torch.no_grad()
+    def run_multi_image(
+        self,
+        images: List[Image.Image],
+        num_samples: int = 1,
+        seed: int = 42,
+        sparse_structure_sampler_params: dict = {},
+        slat_sampler_params: dict = {},
+        formats: List[str] = ['gaussian'],
+        preprocess_image: bool = True,
+        mode: Literal['multidiffusion'] = 'multidiffusion',
+    ) -> dict:
+        """
+        Run the pipeline with multiple images as condition
+
+        Args:
+            images (List[Image.Image]): The multi-view images of the assets
+            num_samples (int): The number of samples to generate.
+            sparse_structure_sampler_params (dict): Additional parameters for the sparse structure sampler.
+            slat_sampler_params (dict): Additional parameters for the structured latent sampler.
+            preprocess_image (bool): Whether to preprocess the image.
+        """
+        if preprocess_image:
+            images = [self.preprocess_image(image) for image in images]
+        cond = self.get_cond(images)
+        cond['neg_cond'] = cond['neg_cond'][:1]
+        torch.manual_seed(seed)
+        ss_steps = {**self.sparse_structure_sampler_params, **sparse_structure_sampler_params}.get('steps')
+        with self.inject_sampler_multi_image('sparse_structure_sampler', len(images), ss_steps, mode=mode):
+            coords = self.sample_sparse_structure(cond, num_samples, sparse_structure_sampler_params)
+        slat_steps = {**self.slat_sampler_params, **slat_sampler_params}.get('steps')
+        with self.inject_sampler_multi_image('slat_sampler', len(images), slat_steps, mode=mode):
+            slat = self.sample_slat(cond, coords, slat_sampler_params)
+        return self.decode_slat(slat, formats)
